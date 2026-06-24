@@ -1,0 +1,35 @@
+{
+  "name": "buildcast",
+  "version": "0.1.0",
+  "description": "Zero-config probabilistic ETA for any git repo. Reads real commit velocity, runs a Monte Carlo forecast, and tells you how much work is left at P50/P85/P95 — with a duty-cycle calendar projection for burst-y / AI-agent builds.",
+  "bin": {
+    "buildcast": "bin/buildcast.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node bin/buildcast.js"
+  },
+  "keywords": [
+    "monte-carlo",
+    "forecast",
+    "estimate",
+    "eta",
+    "git",
+    "velocity",
+    "kanban",
+    "probabilistic-forecasting",
+    "agile",
+    "cycle-time"
+  ],
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ]
+}
