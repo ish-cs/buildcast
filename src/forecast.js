@@ -1,59 +1,46 @@
 'use strict';
-// buildcast forecasting engine — pure, no I/O. Monte Carlo over real task durations.
+// buildcast v2 forecasting engine.
 //
-// Improvements over naive "range × tasks":
-//  1. Monte Carlo: resample remaining tasks from history, sum, take percentiles.
-//     Summing N tasks cancels per-task variance (central limit) → tight band.
-//  2. Type buckets: sample a remaining task from its OWN commit-type history
-//     (feat tasks ≠ test tasks), when the remaining task's type is known.
-//  3. Conditional in-flight: the WIP task has already run `wipElapsedSec`; we
-//     forecast only the REMAINDER (right-censored draw), not a fresh full task.
-//  4. Duty-cycle calendar: learn the active/idle rhythm from commit clock and
-//     convert effort-seconds into a projected wall-clock finish.
+// Pipeline: commits → clean recency-weighted samples (samples.js) → fit a
+// parametric/spliced model selected by AICc (dist.js) → Monte-Carlo the sum of
+// the N remaining tasks → percentiles, scored honestly by CRPS (scoring.js).
+//
+// What v2 fixes over the naive bootstrap (measured on Lawd: P50 coverage 17%,
+// P95 83%, MAPE 62%):
+//   • recency weighting        → tracks non-stationary drift (the 17% under-bias)
+//   • parametric (lognormal)   → a fatter, extrapolated tail (the 83% P95)
+//     tail, Bessel-corrected σ
+//   • reference-class uplift    → corrects residual inside-view optimism
+//   • conditional WIP draw      → P(D|D>T), not the v1 floored `draw−T` bug
+//   • auto-calibration          → picks H + sampler + uplift by walk-forward CRPS
+//
+// Calendar/duty-cycle is intentionally unchanged (v2 is effort-first).
 
-const IDLE_CAP = 3 * 3600; // gaps longer than this = "away", not task work
-const MIN_GAP = 30;        // gaps shorter than this = amend/typo commits
+const {
+  buildSamples,
+  applyRecencyWeights,
+  nEff,
+  commitType,
+  IDLE_CAP,
+} = require('./samples');
+const {
+  selectModel,
+  parametricModel,
+  empiricalModel,
+  churnModel,
+  effectiveN,
+} = require('./dist');
+const { crpsEnsemble, quantileSorted, coverageHit, pit } = require('./scoring');
+const { mulberry32 } = require('./mathutil');
 
-// deterministic RNG (mulberry32) so output is stable until inputs change
-function rng(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+const TRIALS = 20000; // final forecast resolution
+const CV_TRIALS = 4000; // cheaper during calibration walk-forward
+const MIN_SAMPLES = 5; // below this we can't fit anything trustworthy
 
-function percentile(sorted, p) {
-  const n = sorted.length;
-  if (n === 0) return null;
-  if (n === 1) return sorted[0];
-  const k = (n - 1) * p;
-  const lo = Math.floor(k), hi = Math.min(lo + 1, n - 1);
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (k - lo);
-}
+// Back-compat alias — v1 exposed `percentile(sortedAsc, p)`.
+const percentile = quantileSorted;
 
-// conventional-commit type from a subject line: "feat(x): ..." -> "feat"
-function commitType(subject) {
-  const m = /^(\w+)(\([^)]*\))?!?:/.exec((subject || '').trim());
-  return m ? m[1].toLowerCase() : 'other';
-}
-
-// Build per-task duration samples from consecutive task-closing commits.
-// commits: [{ts (unix sec), subject, churn?}], ascending by ts.
-// Each gap is attributed to the task CLOSED by the later commit.
-function buildSamples(commits) {
-  const samples = [];
-  for (let i = 1; i < commits.length; i++) {
-    const dur = commits[i].ts - commits[i - 1].ts;
-    if (dur < MIN_GAP || dur > IDLE_CAP) continue;
-    samples.push({ dur, type: commitType(commits[i].subject), churn: commits[i].churn || 0 });
-  }
-  return samples;
-}
-
-// Duty cycle + active-hour profile from ALL commit timestamps (not just tasks).
+// ── duty-cycle calendar (unchanged from v1) ────────────────────────────────
 function dutyProfile(allTimestamps) {
   const ts = [...allTimestamps].sort((a, b) => a - b);
   if (ts.length < 2) return { dutyCycle: null, activeSec: 0, wallSec: 0 };
@@ -66,107 +53,390 @@ function dutyProfile(allTimestamps) {
   return { dutyCycle: wall > 0 ? active / wall : null, activeSec: active, wallSec: wall };
 }
 
-// Core Monte Carlo forecast.
-// opts:
-//   commits        [{ts, subject, churn?}]  task-closing commits, ascending
-//   allTimestamps  number[]                 every commit ts (for duty cycle); defaults to commits' ts
-//   remainingFull  int                      untouched tasks
-//   remainingWip   int                      in-flight tasks (default 0)
-//   wipElapsedSec  number                   how long the in-flight task has already run
-//   remainingTypes string[]                 optional known types of remaining tasks (e.g. ['feat','test'])
-//   nowSec         number                   current unix sec (for calendar); required for calendar
-//   trials         int                      MC iterations (default 20000)
-//   seed           int                      RNG seed (default 42)
-function forecast(opts) {
+// ── weighted log-space statistics ──────────────────────────────────────────
+function weightedLogMean(samples) {
+  let W = 0;
+  let s = 0;
+  for (const x of samples) {
+    const w = x.weight == null ? 1 : x.weight;
+    W += w;
+    s += w * Math.log(x.dur);
+  }
+  return W > 0 ? s / W : 0;
+}
+
+// Pooled within-type variance of ln(dur): Σ_t Σ_i w (ln dur − μ_t)² / (Σw − k).
+// Falls back to the ungrouped log-variance when there are too few types.
+function pooledLogVar(byType, globalMu) {
+  let num = 0;
+  let W = 0;
+  let k = 0;
+  for (const arr of byType.values()) {
+    if (!arr.length) continue;
+    k++;
+    const mu = weightedLogMean(arr);
+    for (const x of arr) {
+      const w = x.weight == null ? 1 : x.weight;
+      num += w * (Math.log(x.dur) - mu) ** 2;
+      W += w;
+    }
+  }
+  const denom = W - k;
+  if (denom > 1e-9) return num / denom;
+  // Degenerate (every type has ~1 effective sample): use the global spread.
+  let n2 = 0;
+  let W2 = 0;
+  for (const arr of byType.values())
+    for (const x of arr) {
+      const w = x.weight == null ? 1 : x.weight;
+      n2 += w * (Math.log(x.dur) - globalMu) ** 2;
+      W2 += w;
+    }
+  return W2 > 0 ? n2 / W2 : 1e-6;
+}
+
+function groupByType(samples) {
+  const m = new Map();
+  for (const x of samples) {
+    if (!m.has(x.type)) m.set(x.type, []);
+    m.get(x.type).push(x);
+  }
+  return m;
+}
+
+// ── model construction (global + per-type, hierarchical) ───────────────────
+// Returns a global model (AICc-selected, optionally spliced) plus a lognormal
+// model per type whose log-mean is shrunk toward the global mean (dist.js does
+// the empirical-Bayes shrinkage). Type models share one pooled σ — fitting a
+// per-type σ from 3-5 samples is pure noise.
+function buildModels(samples, { sampler = 'empirical' } = {}) {
+  // The global sampler is chosen by calibration. Crucially 'empirical' (the v1
+  // weighted bootstrap) is in the menu, so v2 can degrade to the baseline when
+  // a parametric fit wouldn't help — guaranteeing v2 ≥ v1 within CV noise.
+  let model;
+  let family;
+  let aicc = null;
+  let weights = null;
+  if (sampler === 'empirical') {
+    model = empiricalModel(samples);
+    family = 'empirical';
+  } else if (sampler === 'churn') {
+    // churn-conditional, blind use (size unknown). Falls back to empirical when
+    // there isn't enough churn signal. NOT in the default calibrate menu — the
+    // gate (below) shows it can't beat the baseline blind; it's here so the
+    // capability can be measured and used explicitly.
+    const cm = churnModel(samples);
+    model = cm || empiricalModel(samples);
+    family = cm ? 'churn' : 'empirical';
+  } else {
+    const sel = selectModel(samples, { spliced: sampler === 'spliced' });
+    model = sel.model;
+    family = sel.family;
+    aicc = sel.aicc;
+    weights = sel.weights;
+  }
+  const globalMu = weightedLogMean(samples);
+
+  const byType = groupByType(samples);
+  const sigma2 = pooledLogVar(byType, globalMu);
+  const sigma = Math.sqrt(Math.max(sigma2, 1e-12));
+
+  // Per-type shrinkage via dist.shrinkTypeMeans (handles <3 types → no shrink).
+  const { shrinkTypeMeans } = require('./dist');
+  const perType = [];
+  for (const [type, arr] of byType) {
+    if (!arr.length) continue;
+    perType.push({ type, mu: weightedLogMean(arr), nEff: effectiveN(arr) });
+  }
+  const shrunk = shrinkTypeMeans(perType, globalMu, sigma2);
+  const typeModels = new Map();
+  for (const s of shrunk) {
+    typeModels.set(
+      s.type,
+      parametricModel({ family: 'lognormal', mu: s.muStar, sigma }),
+    );
+  }
+
+  return { model, typeModels, family, aicc, weights };
+}
+
+// ── Monte-Carlo sum of the remaining tasks ─────────────────────────────────
+// Returns the ASCENDING-sorted ensemble of total-effort draws.
+function simulate(models, opts) {
   const {
-    commits = [], remainingFull = 0, remainingWip = 0, wipElapsedSec = 0,
-    remainingTypes = null, nowSec = null, trials = 20000, seed = 42,
+    remainingFull = 0,
+    remainingWip = 0,
+    wipElapsedSec = 0,
+    remainingTypes = null,
+    trials = TRIALS,
+    seed = 42,
+    uplift = 1,
   } = opts;
-  const allTs = opts.allTimestamps || commits.map(c => c.ts);
-
-  const samples = buildSamples(commits);
-  const remaining = remainingFull + (remainingWip > 0 ? 1 : 0); // distinct task count
-  const out = { method: 'monte-carlo', samples: samples.length, remainingTasks: remainingFull + remainingWip };
-
-  if (remainingFull <= 0 && remainingWip <= 0) { out.done = true; return out; }
-  if (samples.length < 5) { out.insufficient = true; return out; }
-
-  // global pool + per-type pools
-  const pool = samples.map(s => s.dur);
-  const byType = {};
-  for (const s of samples) (byType[s.type] = byType[s.type] || []).push(s.dur);
-  const drawFrom = (r, arr) => arr[Math.floor(r() * arr.length)];
-  const drawType = (r, type) => {
-    const b = type && byType[type] && byType[type].length >= 3 ? byType[type] : pool;
-    return drawFrom(r, b);
-  };
-
-  const r = rng(seed);
+  const { model, typeModels } = models;
+  const rng = mulberry32(seed);
   const totals = new Array(trials);
+
   for (let t = 0; t < trials; t++) {
     let sum = 0;
     for (let i = 0; i < remainingFull; i++) {
-      const type = remainingTypes && remainingTypes[i] ? remainingTypes[i] : null;
-      sum += drawType(r, type);
+      let m = model;
+      if (remainingTypes && remainingTypes[i] && typeModels && typeModels.has(remainingTypes[i])) {
+        m = typeModels.get(remainingTypes[i]);
+      }
+      sum += m.sample(rng);
     }
     for (let w = 0; w < remainingWip; w++) {
-      // conditional: only the remainder beyond what's already elapsed
-      sum += Math.max(0, drawFrom(r, pool) - wipElapsedSec);
+      // Conditional remainder of an already-running task: draw D|D>elapsed, minus elapsed.
+      sum += model.conditionalSample(rng, wipElapsedSec) - wipElapsedSec;
     }
-    totals[t] = sum;
+    totals[t] = sum * uplift;
   }
   totals.sort((a, b) => a - b);
+  return totals;
+}
 
-  const eP50 = percentile(totals, 0.50);
-  const eP85 = percentile(totals, 0.85);
-  const eP95 = percentile(totals, 0.95);
-  out.effort = { p50: eP50, p85: eP85, p95: eP95 };
-  out.perTaskTypical = percentile([...pool].sort((a, b) => a - b), 0.50);
+// ── walk-forward evaluation (expanding window, no leakage) ──────────────────
+// Generic over a `forecaster(trainSamples, horizon, seed) → sortedEnsemble`.
+// `trainSamples` are raw {dur,type,churn}; the forecaster re-derives recency
+// weights itself (ageIdx is relative to the training slice).
+function reindex(slice) {
+  const n = slice.length;
+  return slice.map((x, i) => ({ ...x, ageIdx: n - 1 - i, weight: 1 }));
+}
 
-  // duty-cycle calendar
+function walkForward(samples, forecaster, opts = {}) {
+  const n = samples.length;
+  const horizon = opts.horizon || 1;
+  const warmup = opts.warmup || Math.max(15, Math.ceil(0.4 * n));
+  const seed = opts.seed || 1000;
+  const out = [];
+  for (let t = warmup; t + horizon <= n; t++) {
+    const train = samples.slice(0, t);
+    let actual = 0;
+    for (let h = 0; h < horizon; h++) actual += samples[t + h].dur;
+    const ens = forecaster(train, horizon, seed + t);
+    if (!ens || !ens.length) continue;
+    out.push({
+      actual,
+      crps: crpsEnsemble(ens, actual),
+      p50: quantileSorted(ens, 0.5),
+      pit: pit(ens, actual),
+      hit50: coverageHit(ens, actual, 0.5),
+      hit85: coverageHit(ens, actual, 0.85),
+      hit95: coverageHit(ens, actual, 0.95),
+    });
+  }
+  return out;
+}
+
+// A v2 forecaster bound to a config {H, sampler, uplift}.
+function makeV2Forecaster({ H, sampler = 'empirical', uplift = 1, trials = CV_TRIALS }) {
+  return (train, horizon, seed) => {
+    const reidx = reindex(train);
+    const { samples: weighted } = applyRecencyWeights(reidx, H);
+    const models = buildModels(weighted, { sampler });
+    return simulate(models, { remainingFull: horizon, trials, seed, uplift });
+  };
+}
+
+function meanCRPS(rows) {
+  if (!rows.length) return Infinity;
+  return rows.reduce((a, r) => a + r.crps, 0) / rows.length;
+}
+
+// ── auto-calibration ───────────────────────────────────────────────────────
+// Picks the half-life H and sampler mode that minimize walk-forward CRPS, then
+// derives a reference-class uplift and keeps it only if it lowers CRPS. Family
+// is chosen per-fit by AICc inside buildModels. Small grid + tie-break-to-
+// simpler to avoid hyperparameter over-fit on short histories.
+const SAMPLER_RANK = { empirical: 0, parametric: 1, spliced: 2 };
+
+function calibrate(samples, opts = {}) {
+  const n = samples.length;
+  const horizon = opts.horizon || 1;
+  const warmup = Math.max(15, Math.ceil(0.4 * n));
+  const origins = n - warmup - horizon + 1;
+
+  // candidate half-lives in commit-index units; ∞ = unweighted (stationary)
+  const Hgrid = [Infinity, n, Math.max(8, Math.round(n / 2)), Math.max(6, Math.round(n / 3))];
+  const samplerModes = ['empirical', 'parametric', 'spliced'];
+
+  // Too few origins to validate any correction → behave EXACTLY like the v1
+  // baseline (unweighted empirical bootstrap, no uplift). Recency weighting or a
+  // reference-class uplift we can't cross-validate on <10 origins does more harm
+  // than good — it made v2 lose to v1 on small repos. Don't deploy unvalidated
+  // machinery.
+  if (origins < 10) {
+    return { H: Infinity, sampler: 'empirical', uplift: 1, family: 'empirical', cvCRPS: null, origins, calibrated: false };
+  }
+
+  let best = null;
+  for (const H of Hgrid) {
+    // guard: reject weighting so aggressive the effective sample size collapses
+    const probe = applyRecencyWeights(reindex(samples), H);
+    if (probe.nEff < 8 && Number.isFinite(H)) continue;
+    for (const sampler of samplerModes) {
+      const rows = walkForward(samples, makeV2Forecaster({ H, sampler, uplift: 1 }), { horizon, warmup });
+      const c = meanCRPS(rows);
+      if (!best) {
+        best = { H, sampler, cvCRPS: c, rows };
+        continue;
+      }
+      // "Tie" = within 1% of the best CRPS. On a tie, prefer the SIMPLER sampler
+      // (empirical < parametric < spliced) and then the LARGER half-life — so CV
+      // noise never buys complexity, and v2 collapses to the baseline on easy data.
+      const tol = Math.abs(best.cvCRPS) * 0.01;
+      if (c < best.cvCRPS - tol) {
+        best = { H, sampler, cvCRPS: c, rows };
+      } else if (c <= best.cvCRPS + tol) {
+        const simpler = SAMPLER_RANK[sampler] < SAMPLER_RANK[best.sampler];
+        const sameRankBiggerH = SAMPLER_RANK[sampler] === SAMPLER_RANK[best.sampler] && H > best.H;
+        if (simpler || sameRankBiggerH) {
+          // adopt the simpler/larger-H config and record ITS OWN crps + rows, so
+          // the downstream uplift gate compares against a consistent baseline.
+          best = { H, sampler, cvCRPS: c, rows };
+        }
+      }
+    }
+  }
+  if (!best) best = { H: Infinity, sampler: 'empirical', cvCRPS: Infinity, rows: [] };
+
+  // Reference-class uplift, gated on CRPS improvement.
+  const uplift = deriveUplift(best.rows);
+  let chosenUplift = 1;
+  if (uplift !== 1) {
+    const upRows = walkForward(samples, makeV2Forecaster({ H: best.H, sampler: best.sampler, uplift }), { horizon, warmup });
+    if (meanCRPS(upRows) < best.cvCRPS - 1e-9) chosenUplift = uplift;
+  }
+
+  return {
+    H: best.H,
+    sampler: best.sampler,
+    uplift: chosenUplift,
+    family: best.sampler,
+    cvCRPS: best.cvCRPS,
+    origins,
+    calibrated: true,
+  };
+}
+
+// Multiplicative bias = median(actual / forecastP50), clipped to a sane band.
+function deriveUplift(rows) {
+  const ratios = rows
+    .filter((r) => r.p50 > 0)
+    .map((r) => r.actual / r.p50)
+    .sort((a, b) => a - b);
+  if (ratios.length < 3) return 1;
+  const med = quantileSorted(ratios, 0.5);
+  return Math.min(2, Math.max(0.8, med));
+}
+
+// ── main entry ─────────────────────────────────────────────────────────────
+function forecast(opts) {
+  const {
+    commits = [],
+    remainingFull = 0,
+    remainingWip = 0,
+    wipElapsedSec = 0,
+    remainingTypes = null,
+    nowSec = null,
+    trials = TRIALS,
+    seed = 42,
+    auto = true,
+    overrides = {},
+  } = opts;
+  const allTs = opts.allTimestamps || commits.map((c) => c.ts);
+
+  const built = buildSamples(commits, {});
+  const samples = built.samples;
+  const out = {
+    method: 'monte-carlo-v2',
+    samples: samples.length,
+    remainingTasks: remainingFull + remainingWip,
+    awaySec: built.awaySec,
+  };
+
+  if (remainingFull <= 0 && remainingWip <= 0) {
+    out.done = true;
+    return out;
+  }
+  if (samples.length < MIN_SAMPLES) {
+    out.insufficient = true;
+    return out;
+  }
+
+  // Choose hyperparameters (or accept overrides / skip when auto=false).
+  let cfg;
+  if (auto && overrides.H == null) {
+    cfg = calibrate(samples, { horizon: 1 });
+  } else {
+    cfg = {
+      H: overrides.H != null ? overrides.H : Math.max(6, Math.round(samples.length / 3)),
+      sampler: overrides.sampler || 'empirical',
+      uplift: overrides.uplift != null ? overrides.uplift : 1,
+      family: overrides.sampler || 'empirical',
+      calibrated: false,
+    };
+  }
+
+  const { samples: weighted, nEff: neff } = applyRecencyWeights(reindex(samples), cfg.H);
+  const models = buildModels(weighted, { sampler: cfg.sampler });
+  const totals = simulate(models, {
+    remainingFull,
+    remainingWip,
+    wipElapsedSec,
+    remainingTypes,
+    trials,
+    seed,
+    uplift: cfg.uplift,
+  });
+
+  out.effort = {
+    p50: quantileSorted(totals, 0.5),
+    p85: quantileSorted(totals, 0.85),
+    p95: quantileSorted(totals, 0.95),
+  };
+  out.perTaskTypical = quantileSorted([...totals].map((x) => x / (remainingFull + remainingWip)).sort((a, b) => a - b), 0.5);
+  out.model = models.family;
+  out.halfLife = cfg.H;
+  out.uplift = cfg.uplift;
+  out.nEff = neff;
+  out.calibrated = cfg.calibrated;
+
+  // duty-cycle calendar (effort spread at the historical active rate)
   const duty = dutyProfile(allTs);
   out.dutyCycle = duty.dutyCycle;
   if (nowSec != null && duty.dutyCycle && duty.dutyCycle > 0) {
-    const wall = e => Math.round(e / duty.dutyCycle); // effort spread at the historical active rate
+    const wall = (e) => Math.round(e / duty.dutyCycle);
     out.calendar = {
-      p50Sec: nowSec + wall(eP50),
-      p85Sec: nowSec + wall(eP85),
-      wallSecP50: wall(eP50),
-      wallSecP85: wall(eP85),
+      p50Sec: nowSec + wall(out.effort.p50),
+      p85Sec: nowSec + wall(out.effort.p85),
+      wallSecP50: wall(out.effort.p50),
+      wallSecP85: wall(out.effort.p85),
     };
   }
   return out;
 }
 
-// Backtest: hold out the last K task durations, forecast from the rest, check
-// whether actual total landed under P50/P85/P95. Returns calibration hit-rates
-// over many hold-out windows — this is how we substantiate "X out of 100".
-function backtest(commits, { window = 5, seed = 42 } = {}) {
-  const samples = buildSamples(commits).map(s => s.dur);
-  if (samples.length < window + 8) return { insufficient: true, have: samples.length };
-  let n = 0, h50 = 0, h85 = 0, h95 = 0, absErr = 0, sumActual = 0;
-  for (let cut = 8; cut + window <= samples.length; cut++) {
-    const hist = samples.slice(0, cut);
-    const actual = samples.slice(cut, cut + window).reduce((a, b) => a + b, 0);
-    // build a synthetic commit list from hist for forecast()
-    let ts = 0; const synth = [{ ts: 0, subject: 'seed: x' }];
-    for (const d of hist) { ts += d; synth.push({ ts, subject: 'feat: x' }); }
-    const f = forecast({ commits: synth, remainingFull: window, trials: 8000, seed: seed + cut });
-    if (!f.effort) continue;
-    n++;
-    if (actual <= f.effort.p50) h50++;
-    if (actual <= f.effort.p85) h85++;
-    if (actual <= f.effort.p95) h95++;
-    absErr += Math.abs(actual - f.effort.p50);
-    sumActual += actual;
-  }
-  if (!n) return { insufficient: true };
-  return {
-    windows: n,
-    coverageP50: h50 / n, coverageP85: h85 / n, coverageP95: h95 / n,
-    // MAPE of the P50 point estimate vs actual total
-    mapeP50: sumActual ? absErr / sumActual : null,
-  };
-}
-
-module.exports = { forecast, backtest, buildSamples, dutyProfile, percentile, commitType, rng };
+module.exports = {
+  forecast,
+  calibrate,
+  simulate,
+  buildModels,
+  walkForward,
+  makeV2Forecaster,
+  reindex,
+  meanCRPS,
+  deriveUplift,
+  dutyProfile,
+  percentile,
+  // re-exports for back-compat / convenience
+  buildSamples,
+  commitType,
+  applyRecencyWeights,
+  nEff,
+  // lazy re-export to avoid a circular import (backtest.js requires this file)
+  get backtest() {
+    return require('./backtest').backtest;
+  },
+};

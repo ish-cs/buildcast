@@ -23,10 +23,14 @@ test('commitType parses conventional commits', () => {
   assert.equal(commitType('random text'), 'other');
 });
 
-test('buildSamples drops idle (>3h) and amend (<30s) gaps', () => {
-  const c = synth([600, 5, 600, 4 * 3600, 600]); // 5s amend + 4h idle dropped
-  const s = buildSamples(c);
-  assert.deepEqual(s.map(x => x.dur), [600, 600, 600]);
+test('buildSamples winsorizes long gaps, drops <30s amend gaps (v2)', () => {
+  // v2: a sub-30s gap is amend noise → dropped; a long "away" gap is winsorized
+  // to awaySec (task kept, contribution bounded) rather than dropped — keeping
+  // the task count honest and the tail un-thinned.
+  const c = synth([600, 5, 600, 4 * 3600, 600]);
+  const { samples, dropped } = buildSamples(c, { awaySec: 10800 });
+  assert.equal(dropped, 1, 'the 5s amend gap is dropped');
+  assert.deepEqual(samples.map((x) => x.dur), [600, 600, 10800, 600]);
 });
 
 test('constant history → effort ≈ exact multiple (Monte Carlo sanity)', () => {
@@ -68,6 +72,47 @@ test('dutyProfile drops long idle gaps from active time', () => {
   for (let k = 0; k < 6; k++) { ts.push(t); t += 600; ts.push(t); t += 4 * 3600; }
   const d = dutyProfile(ts);
   assert.ok(d.dutyCycle > 0.01 && d.dutyCycle < 0.2, `duty=${d.dutyCycle}`);
+});
+
+// ── v2 contract: wins when the data is pathological, ties when it isn't ──────
+const { mulberry32, randNormal } = require('../src/mathutil');
+const { abCompare } = require('../src/backtest');
+
+test('v2 beats v1 on a non-stationary drift series (the original failure mode)', () => {
+  // Engineered ~10x upward drift over the history. v1's equal-weight bootstrap
+  // under-estimates the (larger) near future and its tail collapses; v2's
+  // recency weighting + uplift + parametric tail should fix both.
+  const rng = mulberry32(11);
+  const durs = [];
+  for (let i = 0; i < 70; i++) durs.push(Math.exp(Math.log(240) + (i / 70) * Math.log(10) + 0.35 * randNormal(rng)));
+  const r = abCompare(synth(durs), { horizon: 5 });
+  assert.ok(!r.insufficient, 'enough history');
+  assert.ok(r.skill > 0.3, `v2 should beat v1 by >30% CRPS skill on drift, got ${(r.skill * 100).toFixed(0)}%`);
+  assert.ok(r.v2.coverageP95 > r.v1.coverageP95, 'v2 repairs the P95 tail under-coverage');
+});
+
+test('v2 degrades gracefully (≈v1) on a stationary series', () => {
+  // No drift, moderate spread: the empirical bootstrap is already near-optimal,
+  // so v2 should pick `empirical` and not be meaningfully worse than v1.
+  const rng = mulberry32(5);
+  const durs = [];
+  for (let i = 0; i < 60; i++) durs.push(Math.exp(Math.log(600) + 0.5 * randNormal(rng)));
+  const r = abCompare(synth(durs), { horizon: 3 });
+  assert.ok(!r.insufficient, 'enough history');
+  assert.ok(r.skill > -0.05, `v2 should not be >5% worse than v1 on stationary data, got ${(r.skill * 100).toFixed(0)}%`);
+});
+
+test('v2 falls back to pure v1 on a short history (too few CV origins)', () => {
+  // Small repo (≈7 CV origins at horizon 5) → calibrate can't validate any
+  // correction, so it must behave like the v1 bootstrap, not apply an un-gated
+  // recency/uplift that loses (the convoy −10% regression).
+  const rng = mulberry32(31);
+  const durs = [];
+  for (let i = 0; i < 26; i++) durs.push(Math.exp(Math.log(500) + 0.5 * randNormal(rng)));
+  const r = abCompare(synth(durs), { horizon: 5 });
+  assert.ok(!r.insufficient, 'enough for a few origins');
+  assert.equal(r.config.calibrated, false, 'short history → uncalibrated defaults');
+  assert.ok(r.skill > -0.05, `v2 must not regress vs v1 on short history, got ${(r.skill * 100).toFixed(0)}%`);
 });
 
 test('calibration backtest: P85 coverage lands in a sane band', () => {
